@@ -1,0 +1,135 @@
+name: Android Build (APK + AAB)
+
+# Builds signed release APK and AAB on every push to main.
+# Signing secrets come from GitHub Secrets (never committed):
+#   ANDROID_KEYSTORE_BASE64  - base64 of the PKCS12 keystore
+#   ANDROID_KEYSTORE_PASSWORD - keystore password
+#   ANDROID_KEY_ALIAS        - key alias
+#   ANDROID_KEY_PASSWORD     - key password (same as keystore password)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build signed release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Platform 35 and Build Tools 35.0.0
+        run: |
+          yes | sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Align Expo dependency versions
+        run: npx expo install --fix
+
+      - name: Expo Doctor
+        run: npx expo-doctor || true
+
+      - name: Verify dependency versions
+        run: npx expo install --check || true
+
+      - name: Expo prebuild (generate android project)
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Decode keystore from secret
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
+
+      - name: Configure signing (gradle.properties)
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          {
+            echo "SIPORA_UPLOAD_STORE_FILE=release.keystore"
+            echo "SIPORA_UPLOAD_STORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
+            echo "SIPORA_UPLOAD_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+            echo "SIPORA_UPLOAD_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+          } >> android/gradle.properties
+
+      - name: Inject release signing config into build.gradle
+        run: |
+          APP_GRADLE=android/app/build.gradle
+          # Add a release signing config that reads the injected properties,
+          # and point the release build type at it. Idempotent guard included.
+          if ! grep -q "SIPORA_UPLOAD_STORE_FILE" "$APP_GRADLE"; then
+            node - "$APP_GRADLE" <<'NODE'
+          const fs = require('fs');
+          const path = process.argv[2];
+          let g = fs.readFileSync(path, 'utf8');
+
+          const signingBlock = `
+        signingConfigs {
+            release {
+                if (project.hasProperty('SIPORA_UPLOAD_STORE_FILE')) {
+                    storeFile file(SIPORA_UPLOAD_STORE_FILE)
+                    storePassword SIPORA_UPLOAD_STORE_PASSWORD
+                    keyAlias SIPORA_UPLOAD_KEY_ALIAS
+                    keyPassword SIPORA_UPLOAD_KEY_PASSWORD
+                }
+            }
+        }
+`;
+          // Insert signingConfigs right after "android {"
+          g = g.replace(/android\s*\{/, match => match + '\n' + signingBlock);
+
+          // Point release buildType to the release signing config.
+          g = g.replace(/buildTypes\s*\{[\s\S]*?release\s*\{/, block =>
+            block + '\n            signingConfig signingConfigs.release'
+          );
+
+          fs.writeFileSync(path, g);
+          console.log('Injected release signing config.');
+          NODE
+          fi
+
+      - name: Build signed release APK
+        run: |
+          cd android
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Build signed release AAB
+        run: |
+          cd android
+          ./gradlew bundleRelease --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sipora-daily-water-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sipora-daily-water-aab
+          path: android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
