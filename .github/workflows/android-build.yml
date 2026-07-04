@@ -64,6 +64,9 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          # Ensure a newline separates our properties from any final line
+          # in the generated gradle.properties (which may lack a trailing newline).
+          printf '\n' >> android/gradle.properties
           {
             echo "SIPORA_UPLOAD_STORE_FILE=release.keystore"
             echo "SIPORA_UPLOAD_STORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
